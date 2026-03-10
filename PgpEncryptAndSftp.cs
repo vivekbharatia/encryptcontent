@@ -40,6 +40,9 @@ public class PgpEncryptAndSftp
     private readonly string _localPgpKeyPath =
         Environment.GetEnvironmentVariable("LocalPgpKeyPath") ?? "test_public.asc";
 
+    private readonly bool _useAccountLevelSas =
+        bool.TryParse(Environment.GetEnvironmentVariable("UseAccountLevelSas"), out var result) ? result : true;
+
     // --------------------------------------------------------------------
     // FUNCTION ENTRY POINT
     // --------------------------------------------------------------------
@@ -60,7 +63,7 @@ public class PgpEncryptAndSftp
         // -------------------------
         // Generate SAS INSIDE FUNCTION
         // -------------------------
-        string containerSas = await GenerateContainerCreateSasAsync();
+        string containerSas = await GenerateContainerCreateSasAsync(_useAccountLevelSas);
         string content = _storageAccountName+" "+ containerSas;
         // -------------------------
         // Key Vault access
@@ -114,35 +117,80 @@ public class PgpEncryptAndSftp
     }
 
     // --------------------------------------------------------------------
-    // SAS GENERATION (CONTAINER | CREATE | 8 HOURS)
+    // SAS GENERATION (ACCOUNT LEVEL OR BLOB LEVEL)
+    // useAccountLevel: true = Account-level SAS, false = Blob-level SAS
     // --------------------------------------------------------------------
-    private async Task<string> GenerateContainerCreateSasAsync()
+    private async Task<string> GenerateContainerCreateSasAsync(bool useAccountLevel)
+    {
+         return await GenerateBlobLevelSasAsync();
+        // if (useAccountLevel)
+        // {
+        //     return await GenerateAccountLevelSasAsync();
+        // }
+        // else
+        // {
+        //     return await GenerateBlobLevelSasAsync();
+        // }
+    }
+
+    private async Task<string> GenerateAccountLevelSasAsync()
+    {
+        var storageAccountKey = Environment.GetEnvironmentVariable("StorageAccountKey");
+        
+        if (string.IsNullOrWhiteSpace(storageAccountKey))
+        {
+            throw new InvalidOperationException("StorageAccountKey environment variable is not set.");
+        }
+
+        var credential = new Azure.Storage.StorageSharedKeyCredential(_storageAccountName, storageAccountKey);
+
+        var sasBuilder = new AccountSasBuilder
+        {
+            Services = AccountSasServices.Blobs,
+            ResourceTypes = AccountSasResourceTypes.Container | AccountSasResourceTypes.Object,
+            Protocol = SasProtocol.Https,
+            StartsOn = DateTimeOffset.UtcNow,
+            ExpiresOn = DateTimeOffset.UtcNow.AddHours(24)
+        };
+
+        sasBuilder.SetPermissions(
+            AccountSasPermissions.Read |
+            AccountSasPermissions.List |
+            AccountSasPermissions.Create);
+
+        var sasToken = sasBuilder
+            .ToSasQueryParameters(credential)
+            .ToString();
+
+        return $"?{sasToken}";
+    }
+
+    private async Task<string> GenerateBlobLevelSasAsync()
     {
         var blobServiceClient = new BlobServiceClient(
             new Uri($"https://{_storageAccountName}.blob.core.windows.net"),
             new DefaultAzureCredential());
 
-        // Delegation key must outlive SAS
-        var delegationKey = await blobServiceClient.GetUserDelegationKeyAsync(
-            DateTimeOffset.UtcNow.AddMinutes(-5),
-            DateTimeOffset.UtcNow.AddHours(9));
+        var containerClient = blobServiceClient.GetBlobContainerClient(_blobContainerName);
 
         var sasBuilder = new BlobSasBuilder
         {
             BlobContainerName = _blobContainerName,
-            Resource = "c",
-            StartsOn = DateTimeOffset.UtcNow.AddMinutes(-5),
-            ExpiresOn = DateTimeOffset.UtcNow.AddHours(8),
-            Protocol = SasProtocol.Https
+            Protocol = SasProtocol.Https,
+            StartsOn = DateTimeOffset.UtcNow,
+            ExpiresOn = DateTimeOffset.UtcNow.AddHours(24)
         };
 
-        sasBuilder.SetPermissions(BlobContainerSasPermissions.Create);
+        sasBuilder.SetPermissions(
+            BlobSasPermissions.Read |
+            BlobSasPermissions.List |
+            BlobSasPermissions.Create);
 
-        var sas = sasBuilder.ToSasQueryParameters(
-            delegationKey,
-            _storageAccountName).ToString();
+        var sasToken = sasBuilder
+            .ToSasQueryParameters(new Azure.Storage.StorageSharedKeyCredential(_storageAccountName, Environment.GetEnvironmentVariable("StorageAccountKey")))
+            .ToString();
 
-        return $"?{sas}";
+        return $"?{sasToken}";
     }
 
     // --------------------------------------------------------------------
